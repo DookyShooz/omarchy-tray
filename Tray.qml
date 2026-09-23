@@ -19,6 +19,13 @@ BarWidget {
   id: root
   moduleName: "io.github.tyrichards.tray"
 
+  // Omarchy 4 gives third-party widgets a scoped bar facade. The companion
+  // service receives the capability-filtered widget catalogue and exposes it
+  // back to this tray through the plugin's own scoped service lookup.
+  readonly property var trayService: bar && bar.shell && typeof bar.shell.serviceFor === "function"
+    ? bar.shell.serviceFor(root.moduleName) : null
+  readonly property var hostedWidgetRegistry: trayService ? trayService.barWidgetRegistry : null
+
   // Hover-to-expand, driven by the drag-out overlay's single HoverHandler:
   // two stacked hover items (the overlay plus a handler in the drawer) fight
   // over hover and oscillate the reveal, so the overlay is the one authority.
@@ -1639,7 +1646,7 @@ BarWidget {
       ? String(root.bar.customModuleType(entry) || "") : ""
     readonly property var registryComponent: {
       if (customType) return null
-      var registry = root.bar ? root.bar.barWidgetRegistry : null
+      var registry = root.hostedWidgetRegistry
       if (!registry) return null
       var revision = registry.revision
       var record = registry.widgets[widgetId]
@@ -1659,9 +1666,8 @@ BarWidget {
 
     Component.onCompleted: root.registerHostedDelegate(hostedRoot)
     Component.onDestruction: {
-      // Unregister first: if anything below throws mid-teardown, a stale
-      // delegate left in the list would poison every future hit test.
-      root.unregisterHostedDelegate(hostedRoot)
+      // A plugin rescan can destroy the tray before its hosted delegates.
+      if (root) root.unregisterHostedDelegate(hostedRoot)
       if (dragOutMouse && dragOutMouse.dragDelegate === hostedRoot) dragOutMouse.dragDelegate = null
     }
 
