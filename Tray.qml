@@ -854,9 +854,9 @@ BarWidget {
     persistState({ hidden: h })
   }
 
-  // Stay on screen while a drag is in flight even when otherwise empty, so
-  // there is always a drop target to aim at.
-  visible: hasDrawerContent || hostedWrappers.length > 0 || dragActive
+  // Keep the chevron and drop target available even on a fresh install with
+  // no status-notifier items or captured widgets.
+  visible: true
 
   // When the manage popup is open, the bar underlines the whole tray — from
   // the chevron's left edge to the last icon — instead of its default 55%
@@ -911,8 +911,7 @@ BarWidget {
       // gap could hollow out most of the bar.
       readonly property real drawerExtent: drawerRow.implicitWidth
       readonly property real revealExtent: drawerExtent * root.revealProgress
-      readonly property bool showDrawerBlock: root.hasDrawerContent || root.dragActive
-      readonly property real drawerBlockWidth: showDrawerBlock ? expandIcon.implicitWidth + revealExtent : 0
+      readonly property real drawerBlockWidth: expandIcon.implicitWidth + revealExtent
 
       implicitWidth: drawerBlockWidth
       implicitHeight: root.barSize
@@ -920,7 +919,7 @@ BarWidget {
       Binding {
         target: root
         property: "chevronExtent"
-        value: horizontalTrayRoot.showDrawerBlock ? expandIcon.implicitWidth : 0
+        value: expandIcon.implicitWidth
       }
 
       Item {
@@ -928,7 +927,6 @@ BarWidget {
         x: 0
         width: horizontalTrayRoot.drawerBlockWidth
         height: root.barSize
-        visible: horizontalTrayRoot.showDrawerBlock
 
         BarIconButton {
           id: expandIcon
@@ -983,8 +981,7 @@ BarWidget {
 
       readonly property real drawerExtent: drawerColumn.implicitHeight
       readonly property real revealExtent: drawerExtent * root.revealProgress
-      readonly property bool showDrawerBlock: root.hasDrawerContent || root.dragActive
-      readonly property real drawerBlockHeight: showDrawerBlock ? expandIcon.implicitHeight + revealExtent : 0
+      readonly property real drawerBlockHeight: expandIcon.implicitHeight + revealExtent
 
       implicitWidth: root.barSize
       implicitHeight: drawerBlockHeight
@@ -992,7 +989,7 @@ BarWidget {
       Binding {
         target: root
         property: "chevronExtent"
-        value: verticalTrayRoot.showDrawerBlock ? expandIcon.implicitHeight : 0
+        value: expandIcon.implicitHeight
       }
 
       Item {
@@ -1000,7 +997,6 @@ BarWidget {
         y: 0
         width: root.barSize
         height: verticalTrayRoot.drawerBlockHeight
-        visible: verticalTrayRoot.showDrawerBlock
 
         BarIconButton {
           id: expandIcon
