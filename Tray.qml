@@ -213,7 +213,9 @@ BarWidget {
   // when it is released here, capture the widget into the drawer.
   // ---------------------------------------------------------------------------
 
-  readonly property bool dragActive: root.bar ? dragEligible(root.bar.barDragSource) : false
+  readonly property bool hasBarDragApi: root.bar && "barDragSource" in root.bar
+  readonly property bool dragActive: scopedDragPointer !== null || (hasBarDragApi && dragEligible(root.bar.barDragSource))
+  property var scopedDragPointer: null
   property bool dragOver: false
   property string dragSourceId: ""
   // Insertion pick for a bar widget being dragged in: where among the drawer
@@ -232,11 +234,7 @@ BarWidget {
     return !!win && root.bar.barDragWindow === win
   }
 
-  function updateDragOver() {
-    if (!dragEligible(root.bar ? root.bar.barDragSource : null)) {
-      dragOver = false
-      return
-    }
+  function updateDragOverAt(x, y) {
     var origin
     try {
       origin = root.mapToItem(null, 0, 0)
@@ -244,15 +242,114 @@ BarWidget {
       dragOver = false
       return
     }
-    var x = root.bar.barDragSceneX
-    var y = root.bar.barDragSceneY
     dragOver = x >= origin.x && x <= origin.x + root.width
       && y >= origin.y && y <= origin.y + root.height
     dragInPick = dragOver ? drawerReorderPick(Qt.point(x, y), null) : null
   }
 
+  function updateDragOver() {
+    if (!dragEligible(root.bar ? root.bar.barDragSource : null)) {
+      dragOver = false
+      return
+    }
+    updateDragOverAt(root.bar.barDragSceneX, root.bar.barDragSceneY)
+  }
+
+  // Omarchy 4 injects a presentation-only bar facade; it does not forward
+  // barDragSource or the drag coordinates. The bar's visual module slots are
+  // still in this window's item tree. Observe the source slot's own drag
+  // MouseArea instead, without reaching into the host Bar or changing Omarchy.
+  function findScopedDragPointer() {
+    var win = root.QsWindow ? root.QsWindow.window : null
+    if (!win || !win.contentItem) return null
+    var pending = [win.contentItem]
+    while (pending.length) {
+      var item = pending.pop()
+      if (item.dragSource === true && item.moduleName && item.moduleName !== root.moduleName) {
+        var children = item.children || []
+        for (var i = 0; i < children.length; i++) {
+          if (children[i].dragging === true && typeof children[i].mouseX === "number")
+            return { slot: item, pointer: children[i] }
+        }
+      }
+      var descendants = item.children || []
+      for (var j = 0; j < descendants.length; j++) pending.push(descendants[j])
+    }
+    return null
+  }
+
+  function updateScopedDragOver(pointer) {
+    if (!pointer) return
+    var point = pointer.mapToItem(null, pointer.mouseX, pointer.mouseY)
+    updateDragOverAt(point.x, point.y)
+  }
+
+  function finishDragIn() {
+    // Defer the capture past the bar's release handler: a synchronous config
+    // write would rebuild the source slot mid-gesture. Keep only plain values
+    // and the shell facade, since this widget may be destroyed by that rebuild.
+    var wanted = root.dragOver ? root.dragSourceId : ""
+    var nextOrder = null
+    if (wanted) {
+      var keys = root.drawerEntries.map(function(entry) { return entry.key })
+      var beforeKey = root.dragInPick ? String(root.dragInPick.beforeKey) : ""
+      var insertAt = beforeKey !== "" ? keys.indexOf(beforeKey) : -1
+      if (insertAt < 0) keys.push(wanted)
+      else keys.splice(insertAt, 0, wanted)
+      nextOrder = keys
+    }
+    root.dragOver = false
+    root.dragSourceId = ""
+    root.dragInPick = null
+    root.scopedDragPointer = null
+    if (!wanted) return
+    var shellRef = root.bar ? root.bar.shell : null
+    var serviceRef = root.trayService
+    var nativeBar = root.hasBarDragApi
+    var trayId = root.moduleName || "io.github.tyrichards.tray"
+    Qt.callLater(function() {
+      // Legacy bars expose full config mutation. Omarchy 4's scoped facade
+      // rejects it; the companion service persists the same change itself.
+      if (nativeBar && shellRef && typeof shellRef.mutateShellConfig === "function") {
+        shellRef.mutateShellConfig(function(config) {
+          TrayModel.captureIntoTray(config, trayId, wanted, nextOrder)
+        })
+      } else if (serviceRef) {
+        serviceRef.captureWidget(trayId, wanted, nextOrder)
+      }
+    })
+  }
+
+  Timer {
+    interval: 16
+    repeat: true
+    running: root.visible && !root.hasBarDragApi
+    onTriggered: {
+      var source = root.findScopedDragPointer()
+      if (!source) {
+        // The source might be torn down by a drop before its signal arrives.
+        if (root.scopedDragPointer) root.finishDragIn()
+        return
+      }
+      root.scopedDragPointer = source.pointer
+      root.dragSourceId = String(source.slot.moduleName)
+      root.updateScopedDragOver(source.pointer)
+    }
+  }
+
   Connections {
-    target: root.bar
+    target: root.scopedDragPointer
+    ignoreUnknownSignals: true
+    function onDraggingChanged() {
+      if (root.scopedDragPointer && !root.scopedDragPointer.dragging) {
+        root.updateScopedDragOver(root.scopedDragPointer)
+        root.finishDragIn()
+      }
+    }
+  }
+
+  Connections {
+    target: root.hasBarDragApi ? root.bar : null
     ignoreUnknownSignals: true
 
     function onBarDragSourceChanged() {
@@ -265,37 +362,7 @@ BarWidget {
         root.updateDragOver()
         return
       }
-      // The drop. Defer the capture past the bar's own release handling: a
-      // synchronous config write here rebuilds the bar mid-gesture, which
-      // tears down the source slot's context while its release handler is
-      // still on the stack (ReferenceError in Bar.qml, and the release leaks
-      // to whatever sits under the cursor). The closure keeps only the shell
-      // reference and plain values, so it survives this widget's own
-      // destruction in the rebuild that the bar's adjacent-slot move causes.
-      var wanted = root.dragOver ? root.dragSourceId : ""
-      // Land the widget exactly where it was released: build the drawer's
-      // next order from the insertion edge tracked during the drag.
-      var nextOrder = null
-      if (wanted) {
-        var keys = root.drawerEntries.map(function(entry) { return entry.key })
-        var beforeKey = root.dragInPick ? String(root.dragInPick.beforeKey) : ""
-        var insertAt = beforeKey !== "" ? keys.indexOf(beforeKey) : -1
-        if (insertAt < 0) keys.push(wanted)
-        else keys.splice(insertAt, 0, wanted)
-        nextOrder = keys
-      }
-      root.dragOver = false
-      root.dragSourceId = ""
-      root.dragInPick = null
-      if (!wanted) return
-      var shellRef = root.bar ? root.bar.shell : null
-      var trayId = root.moduleName || "io.github.tyrichards.tray"
-      if (!shellRef || typeof shellRef.mutateShellConfig !== "function") return
-      Qt.callLater(function() {
-        shellRef.mutateShellConfig(function(config) {
-          TrayModel.captureIntoTray(config, trayId, wanted, nextOrder)
-        })
-      })
+      root.finishDragIn()
     }
 
     // The bar recomputes its own drop marker every pointer move; while an
