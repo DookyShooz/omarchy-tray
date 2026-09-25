@@ -4,9 +4,11 @@
 Usage: tools/drag-test.py [source-widget-id]   (default: omarchy.tailscale)
 
 Phases:
-  1. drag the source widget from the bar onto the tray -> captured in config
+  1. drag the source widget from the bar onto the front of the drawer
+     -> captured in config as the drawer's first item
   2. hover the chevron -> the drawer must physically expand (render check)
-  3. drag the hosted widget back out of the open drawer onto the bar
+  3. drag that first item to the end of the drawer -> drawer order changes
+  4. drag the hosted widget back out of the open drawer onto the bar
      -> entry returns to the bar layout, tray's widgets list is empty
 
 Requires tools/vptr/vptr (run tools/vptr/build.sh once) and a running
@@ -38,6 +40,15 @@ def cursorpos():
 def screen_extent():
     mon = next(m for m in json.loads(subprocess.check_output(["hyprctl", "monitors", "-j"])) if m["focused"])
     return round(mon["width"] / mon["scale"]), round(mon["height"] / mon["scale"])
+
+
+def tray_order():
+    config = json.load(open(pathlib.Path.home() / ".config/omarchy/shell.json"))
+    for section in config["bar"]["layout"].values():
+        for entry in section:
+            if isinstance(entry, dict) and entry.get("id") == TRAY_ID:
+                return [str(t) for t in entry.get("order", [])]
+    return []
 
 
 def tray_state():
@@ -102,6 +113,11 @@ def main():
     cmd("press")
     time.sleep(0.2)
     glide_to((tray["x"] + tray["width"] / 2, bar_y))
+    # Hovering opens the drawer; aim for the front edge, just past the
+    # chevron, so the capture lands first and phases 3-4 know where it is.
+    time.sleep(1.0)
+    front = geometry()[TRAY_ID]
+    glide_to((front["x"] + CHEVRON + 2, bar_y))
     time.sleep(0.4)
     cmd("release")
     time.sleep(1)
@@ -109,7 +125,10 @@ def main():
     hosted, in_layout = tray_state()
     if not hosted:
         finish(f"FAIL(capture): {SOURCE} not found in the tray's widgets list")
-    print("PASS: captured", json.dumps(hosted))
+    order = tray_order()
+    if not order or order[0] != SOURCE:
+        finish(f"FAIL(capture): {SOURCE} not first in drawer order {order}")
+    print("PASS: captured at the drop position", json.dumps(hosted))
 
     # Phase 2: hover the chevron; the drawer must physically expand, proving
     # the captured widget instantiates with nonzero size (the "black hole"
@@ -128,8 +147,28 @@ def main():
         finish(f"FAIL(render): drawer did not expand on hover ({tray['width']} -> {expanded['width']})")
     print(f"PASS: drawer expands and renders ({tray['width']} -> {expanded['width']})")
 
-    # Phase 3: with the drawer open, drag the hosted widget (first item after
-    # the chevron) back out onto the bar, dropping in the gap left of the tray.
+    # Phase 3: reorder inside the open drawer: drag the first item (the
+    # captured widget) past the last one, then drag the last item (now the
+    # captured widget) back in front of the first.
+    front_x = expanded["x"] + CHEVRON + 12
+    back_x = expanded["x"] + expanded["width"] - 12
+    for grab_x, drop_x, want_first in ((front_x, back_x + 10, False), (back_x, front_x - 10, True)):
+        cmd(f"abs {grab_x:.0f} {bar_y:.0f} {ext_w} {ext_h}")
+        time.sleep(0.3)
+        cmd("press")
+        time.sleep(0.2)
+        glide_to((drop_x, bar_y))
+        time.sleep(0.4)
+        cmd("release")
+        time.sleep(1.2)
+        order = tray_order()
+        if SOURCE not in order or (order.index(SOURCE) == 0) != want_first:
+            where = "first" if want_first else "moved back"
+            finish(f"FAIL(reorder): expected {SOURCE} {where}, order={order}")
+    print("PASS: reordered inside the drawer")
+
+    # Phase 4: drag the hosted widget (first item after the chevron) back out
+    # onto the bar, dropping in the gap left of the tray.
     cmd(f"abs {expanded['x'] + CHEVRON + 12:.0f} {bar_y:.0f} {ext_w} {ext_h}")
     time.sleep(0.3)
     cmd("press")

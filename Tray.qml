@@ -207,188 +207,265 @@ BarWidget {
   }
 
   // ---------------------------------------------------------------------------
-  // Drag-into-tray. The bar host tracks every widget drag globally
-  // (barDragSource + barDragSceneX/Y). Watch that state: while a drag from
-  // another widget hovers over this tray, highlight and hold the drawer open;
-  // when it is released here, capture the widget into the drawer.
+  // Drag and drop — one code path, no host-bar APIs.
+  //
+  // Omarchy hands third-party widgets a presentation-only bar facade: no drag
+  // state, no drop math, and mutateShellConfig() exists but refuses (returns
+  // false) for anything that is not a bar plugin. So the tray depends on
+  // exactly two things, both of which it owns or can check:
+  //
+  //   1. Bar slots, read by duck type. Every module slot in this window is an
+  //      Item with string `moduleName` + `region` and a bool `dragSource`,
+  //      whose drag MouseArea child exposes `dragging`. That is the whole
+  //      contract; see barSlots().
+  //   2. Service.qml, the tray's own service, which performs every layout
+  //      write straight to shell.json.
+  //
+  // Everything else (marker, ghost, drop targets) is drawn and computed here.
+  // If either dependency goes missing, the tray says so in the log once
+  // instead of failing silently.
   // ---------------------------------------------------------------------------
 
-  readonly property bool hasBarDragApi: root.bar && "barDragSource" in root.bar
-  readonly property bool dragActive: scopedDragPointer !== null || (hasBarDragApi && dragEligible(root.bar.barDragSource))
-  property var scopedDragPointer: null
-  property bool dragOver: false
-  property string dragSourceId: ""
-  // Insertion pick for a bar widget being dragged in: where among the drawer
-  // content it would land if released right now.
-  property var dragInPick: null
-  property bool markerGuard: false
+  readonly property bool canDrag: trayService !== null
+  onCanDragChanged: if (!canDrag) console.warn("Tray: companion service unavailable; drag and drop disabled")
 
-  // Imperative on purpose: the drag-start handler runs inside the very signal
-  // dispatch that dirtied the dragActive binding, and reading the binding
-  // there can return a stale false. Recomputing from the live properties is
-  // always current.
-  function dragEligible(slot) {
-    if (!slot || !root.bar) return false
-    if (String(slot.moduleName || "") === root.moduleName) return false
+  // Module slots of this bar window, excluding the tray's own. Cached: the
+  // tree walk is cheap but not free, and slots only change on layout edits.
+  property var slotCache: []
+
+  function isBarSlot(item) {
+    return !!item && typeof item.moduleName === "string" && typeof item.region === "string"
+      && typeof item.dragSource === "boolean"
+  }
+
+  function refreshSlots() {
     var win = root.QsWindow ? root.QsWindow.window : null
-    return !!win && root.bar.barDragWindow === win
-  }
-
-  function updateDragOverAt(x, y) {
-    var origin
-    try {
-      origin = root.mapToItem(null, 0, 0)
-    } catch (e) {
-      dragOver = false
-      return
-    }
-    dragOver = x >= origin.x && x <= origin.x + root.width
-      && y >= origin.y && y <= origin.y + root.height
-    dragInPick = dragOver ? drawerReorderPick(Qt.point(x, y), null) : null
-  }
-
-  function updateDragOver() {
-    if (!dragEligible(root.bar ? root.bar.barDragSource : null)) {
-      dragOver = false
-      return
-    }
-    updateDragOverAt(root.bar.barDragSceneX, root.bar.barDragSceneY)
-  }
-
-  // Omarchy 4 injects a presentation-only bar facade; it does not forward
-  // barDragSource or the drag coordinates. The bar's visual module slots are
-  // still in this window's item tree. Observe the source slot's own drag
-  // MouseArea instead, without reaching into the host Bar or changing Omarchy.
-  function findScopedDragPointer() {
-    var win = root.QsWindow ? root.QsWindow.window : null
-    if (!win || !win.contentItem) return null
-    var pending = [win.contentItem]
+    var found = []
+    var pending = win && win.contentItem ? [win.contentItem] : []
     while (pending.length) {
       var item = pending.pop()
-      if (item.dragSource === true && item.moduleName && item.moduleName !== root.moduleName) {
-        var children = item.children || []
-        for (var i = 0; i < children.length; i++) {
-          if (children[i].dragging === true && typeof children[i].mouseX === "number")
-            return { slot: item, pointer: children[i] }
-        }
+      if (isBarSlot(item)) {
+        if (item.moduleName !== root.moduleName) found.push(item)
+        continue
       }
-      var descendants = item.children || []
-      for (var j = 0; j < descendants.length; j++) pending.push(descendants[j])
+      var kids = item.children || []
+      for (var i = 0; i < kids.length; i++) pending.push(kids[i])
     }
+    slotCache = found
+  }
+
+  function barSlots() {
+    // A destroyed slot drops its properties; rescan when that happens.
+    for (var i = 0; i < slotCache.length; i++)
+      if (!isBarSlot(slotCache[i])) { refreshSlots(); break }
+    return slotCache
+  }
+
+  function slotPointer(slot) {
+    var kids = slot ? slot.children || [] : []
+    for (var i = 0; i < kids.length; i++)
+      if (typeof kids[i].dragging === "boolean" && typeof kids[i].mouseX === "number") return kids[i]
     return null
   }
 
-  function updateScopedDragOver(pointer) {
+  function sceneRect(item) {
+    try {
+      var p = item.mapToItem(null, 0, 0)
+      return { x: p.x, y: p.y, width: item.width, height: item.height }
+    } catch (e) {
+      return null
+    }
+  }
+
+  function containsScene(item, point) {
+    var r = sceneRect(item)
+    return !!r && point.x >= r.x && point.x <= r.x + r.width && point.y >= r.y && point.y <= r.y + r.height
+  }
+
+  // Nearest insertion edge among visible bar slots, as a layout position:
+  // { slot, after, region, beforeName } ("" beforeName = end of region).
+  function barDropAt(scenePoint) {
+    var axis = root.vertical ? scenePoint.y : scenePoint.x
+    var rows = []
+    var slots = barSlots()
+    for (var i = 0; i < slots.length; i++) {
+      var s = slots[i]
+      if (!s.visible || s.width <= 0 || s.height <= 0 || s.dragSource) continue
+      var r = sceneRect(s)
+      if (r) rows.push({ slot: s, start: root.vertical ? r.y : r.x, size: root.vertical ? r.height : r.width })
+    }
+    var best = null
+    var bestDist = Infinity
+    for (var j = 0; j < rows.length; j++) {
+      var before = Math.abs(axis - rows[j].start)
+      var after = Math.abs(axis - (rows[j].start + rows[j].size))
+      var d = Math.min(before, after)
+      if (d < bestDist) { bestDist = d; best = { row: rows[j], after: after < before } }
+    }
+    if (!best) return null
+    var target = best.row.slot
+    var beforeName = target.moduleName
+    if (best.after) {
+      // The next visible slot in the same region, tray included: dropping
+      // just left of the tray means "before the tray" in layout terms.
+      var sameRegion = rows.filter(function(row) { return row.slot.region === target.region })
+      var self = sceneRect(root)
+      if (self) sameRegion.push({ slot: { moduleName: root.moduleName }, start: root.vertical ? self.y : self.x })
+      sameRegion.sort(function(a, b) { return a.start - b.start })
+      beforeName = ""
+      for (var k = 0; k < sameRegion.length; k++) {
+        if (sameRegion[k].start > best.row.start) { beforeName = sameRegion[k].slot.moduleName; break }
+      }
+    }
+    return { slot: target, after: best.after, region: target.region, beforeName: beforeName }
+  }
+
+  // Drop marker and drag ghost, parented to the bar window so they draw
+  // above every section. Coordinates are scene coordinates.
+  function showMarker(item, after) {
+    var r = item ? sceneRect(item) : null
+    if (!r) { dropMarker.visible = false; return }
+    var t = Style.spacing.xs
+    if (root.vertical) {
+      dropMarker.x = r.x; dropMarker.width = r.width
+      dropMarker.y = r.y + (after ? r.height : 0) - t / 2; dropMarker.height = t
+    } else {
+      dropMarker.y = r.y; dropMarker.height = r.height
+      dropMarker.x = r.x + (after ? r.width : 0) - t / 2; dropMarker.width = t
+    }
+    dropMarker.visible = true
+  }
+
+  Rectangle {
+    id: dropMarker
+    parent: root.QsWindow && root.QsWindow.window ? root.QsWindow.window.contentItem : root
+    visible: false
+    z: 300
+    color: Color.accent
+    radius: Math.min(width, height) / 2
+  }
+
+  Image {
+    id: dragGhost
+    parent: dropMarker.parent
+    visible: false
+    z: 299
+    opacity: 0.75
+    property real offsetX: 0
+    property real offsetY: 0
+  }
+
+  function startGhost(item, offsetX, offsetY) {
+    dragGhost.offsetX = offsetX
+    dragGhost.offsetY = offsetY
+    if (!item || typeof item.grabToImage !== "function") return
+    item.grabToImage(function(result) {
+      if (!dragOutMouse.dragging || !result) return
+      dragGhost.source = result.url
+      dragGhost.visible = true
+    })
+  }
+
+  function endDragVisuals() {
+    dropMarker.visible = false
+    dragGhost.visible = false
+    dragGhost.source = ""
+  }
+
+  // --- Drag into the tray ----------------------------------------------------
+  // Watch the bar's own slot drags. While one hovers the tray, highlight and
+  // hold the drawer open; when it is released here, capture the widget. The
+  // bar still performs its own move on release (it lands next to the tray);
+  // the capture then runs after it and pulls the entry into the drawer.
+
+  property var dragInPointer: null
+  property bool dragOver: false
+  property string dragSourceId: ""
+  // Where among the drawer content a dragged-in widget would land right now.
+  property var dragInPick: null
+
+  function trackDragIn() {
+    var pointer = dragInPointer
     if (!pointer) return
     var point = pointer.mapToItem(null, pointer.mouseX, pointer.mouseY)
-    updateDragOverAt(point.x, point.y)
+    dragOver = containsScene(root, point)
+    dragInPick = dragOver ? drawerReorderPick(point, null) : null
+    if (dragOver) showMarker(dragInPick ? dragInPick.delegate : null, dragInPick ? dragInPick.after : false)
+    else dropMarker.visible = false
   }
 
   function finishDragIn() {
-    // Defer the capture past the bar's release handler: a synchronous config
-    // write would rebuild the source slot mid-gesture. Keep only plain values
-    // and the shell facade, since this widget may be destroyed by that rebuild.
-    var wanted = root.dragOver ? root.dragSourceId : ""
+    var wanted = dragOver ? dragSourceId : ""
     var nextOrder = null
     if (wanted) {
-      var keys = root.drawerEntries.map(function(entry) { return entry.key })
-      var beforeKey = root.dragInPick ? String(root.dragInPick.beforeKey) : ""
+      var keys = drawerEntries.map(function(entry) { return entry.key })
+      var beforeKey = dragInPick ? String(dragInPick.beforeKey) : ""
       var insertAt = beforeKey !== "" ? keys.indexOf(beforeKey) : -1
       if (insertAt < 0) keys.push(wanted)
       else keys.splice(insertAt, 0, wanted)
       nextOrder = keys
     }
-    root.dragOver = false
-    root.dragSourceId = ""
-    root.dragInPick = null
-    root.scopedDragPointer = null
-    if (!wanted) return
-    var shellRef = root.bar ? root.bar.shell : null
-    var serviceRef = root.trayService
-    var nativeBar = root.hasBarDragApi
-    var trayId = root.moduleName || "io.github.tyrichards.tray"
-    Qt.callLater(function() {
-      // Legacy bars expose full config mutation. Omarchy 4's scoped facade
-      // rejects it; the companion service persists the same change itself.
-      if (nativeBar && shellRef && typeof shellRef.mutateShellConfig === "function") {
-        shellRef.mutateShellConfig(function(config) {
-          TrayModel.captureIntoTray(config, trayId, wanted, nextOrder)
-        })
-      } else if (serviceRef) {
-        serviceRef.captureWidget(trayId, wanted, nextOrder)
-      }
-    })
+    dragInPointer = null
+    dragOver = false
+    dragSourceId = ""
+    dragInPick = null
+    dropMarker.visible = false
+    if (wanted && trayService) trayService.capture(root.moduleName, wanted, nextOrder)
   }
 
   Timer {
+    // Poll the cached slots for a drag start; the facade exposes no signal.
     interval: 16
     repeat: true
-    running: root.visible && !root.hasBarDragApi
+    running: root.visible && root.canDrag
     onTriggered: {
-      var source = root.findScopedDragPointer()
-      if (!source) {
-        // The source might be torn down by a drop before its signal arrives.
-        if (root.scopedDragPointer) root.finishDragIn()
+      if (root.dragSourceId) {
+        // Fallback end: the source slot was destroyed mid-drag (a config
+        // reload), which nulls the pointer without any release signal.
+        if (!root.dragInPointer || !root.dragInPointer.dragging) root.finishDragIn()
         return
       }
-      root.scopedDragPointer = source.pointer
-      root.dragSourceId = String(source.slot.moduleName)
-      root.updateScopedDragOver(source.pointer)
+      var slots = root.barSlots()
+      for (var i = 0; i < slots.length; i++) {
+        if (!slots[i].dragSource) continue
+        var pointer = root.slotPointer(slots[i])
+        if (!pointer || !pointer.dragging) continue
+        root.dragSourceId = slots[i].moduleName
+        root.dragInPointer = pointer
+        root.trackDragIn()
+        return
+      }
     }
   }
 
+  Timer {
+    // Slots come and go with layout edits; keep the cache fresh.
+    interval: 1000
+    repeat: true
+    running: root.visible && root.canDrag
+    triggeredOnStart: true
+    onTriggered: if (!root.dragInPointer && !dragOutMouse.dragging) root.refreshSlots()
+  }
+
   Connections {
-    target: root.scopedDragPointer
+    target: root.dragInPointer
     ignoreUnknownSignals: true
+    function onMouseXChanged() { root.trackDragIn() }
+    function onMouseYChanged() { root.trackDragIn() }
+    // Fires inside the bar's release handler, before its own write.
     function onDraggingChanged() {
-      if (root.scopedDragPointer && !root.scopedDragPointer.dragging) {
-        root.updateScopedDragOver(root.scopedDragPointer)
-        root.finishDragIn()
-      }
+      if (root.dragInPointer && !root.dragInPointer.dragging) root.finishDragIn()
     }
-  }
-
-  Connections {
-    target: root.hasBarDragApi ? root.bar : null
-    ignoreUnknownSignals: true
-
-    function onBarDragSourceChanged() {
-      var slot = root.bar.barDragSource
-      if (slot) {
-        // Only the instance living in the drag's own bar window can win the
-        // drop; every other monitor's copy keeps an empty id and stays inert.
-        var eligible = root.dragEligible(slot)
-        root.dragSourceId = eligible ? String(slot.moduleName || "") : ""
-        root.updateDragOver()
-        return
-      }
-      root.finishDragIn()
-    }
-
-    // The bar recomputes its own drop marker every pointer move; while an
-    // eligible drag hovers the tray, repaint it as the drawer's insertion
-    // edge instead of the bar's adjacent-slot line. The guard stops the
-    // override from re-triggering itself.
-    function onBarDragTargetGeometryChanged() {
-      if (root.markerGuard || !root.dragOver || !root.bar) return
-      root.markerGuard = true
-      root.bar.barDragTargetGeometry = root.dragInPick
-        ? root.bar.dropMarkerRect(root.dragInPick.delegate, root.dragInPick.after)
-        : null
-      root.markerGuard = false
-    }
-
-    function onBarDragSceneXChanged() { root.updateDragOver() }
-    function onBarDragSceneYChanged() { root.updateDragOver() }
   }
 
   // ---------------------------------------------------------------------------
-  // Drag-out-of-tray. A transparent overlay is parented into the bar's module
-  // slot ABOVE its whole-slot drag MouseArea, covering everything except the
-  // chevron. Dragging a hosted widget there drives the bar's own drag state
-  // (ghost, drop marker) through a stand-in slot, and the drop moves the
-  // widget's entry back into the bar layout at that position. Consequence:
-  // the chevron is the only handle that moves the tray itself.
+  // Drag-out-of-tray and in-tray reorder. A transparent overlay is parented
+  // into the bar's module slot ABOVE its whole-slot drag MouseArea, covering
+  // everything except the chevron. Dragging a hosted widget or tray icon
+  // there shows our own ghost and drop marker; releasing over the tray
+  // reorders, releasing over the bar moves the widget's entry back into the
+  // bar layout at that position. Consequence: the chevron is the only handle
+  // that moves the tray itself.
   // ---------------------------------------------------------------------------
 
   // Extent of the chevron along the bar axis, exported by whichever
@@ -499,18 +576,6 @@ BarWidget {
     return null
   }
 
-  // Stand-in for a bar module slot, fed to the bar's drag plumbing while a
-  // hosted widget is dragged out. Provides exactly the properties the bar
-  // reads from a drag source: moduleName, region, and activeItem (for the
-  // ghost image and window resolution).
-  Item {
-    id: fakeDragSlot
-    visible: false
-    property string region: "tray"
-    property string moduleName: ""
-    property var activeItem: null
-  }
-
   Item {
     id: dragOutOverlay
     // The slot stacks its own drag MouseArea above every widget it loads, so
@@ -558,8 +623,8 @@ BarWidget {
       // Order token to insert before when released over the tray ("" = end);
       // null while the pointer is off the tray or nothing can be reordered.
       property var orderBeforeKey: null
-      readonly property bool canReorder: root.bar && root.bar.shell
-        && typeof root.bar.shell.mutateShellConfig === "function"
+      // Bar position to release a hosted widget into, from root.barDropAt().
+      property var barDrop: null
       readonly property real dragThreshold: Style.space(4)
 
       anchors.fill: parent
@@ -571,61 +636,35 @@ BarWidget {
       }
 
       function beginDragOut(mouse) {
-        var b = root.bar
-        var win = root.QsWindow ? root.QsWindow.window : null
         var delegate = dragDelegate || dragIconDelegate
-        if (!b || !win || !delegate) return false
-        fakeDragSlot.moduleName = String(delegate.widgetId || delegate.itemId || "")
-        fakeDragSlot.activeItem = delegate.activeItem || delegate
-        b.barDragWindow = win
-        b.barDragScreen = win.screen
+        if (!delegate) return false
         var local = dragOutMouse.mapToItem(delegate, mouse.x, mouse.y)
-        b.barDragOffsetX = local.x
-        b.barDragOffsetY = local.y
-        b.captureBarDragGhost(fakeDragSlot)
-        b.barDragSource = fakeDragSlot
+        root.refreshSlots()
+        root.startGhost(delegate.activeItem || delegate, local.x, local.y)
         return true
       }
 
       function updateDragOut(mouse) {
-        var b = root.bar
-        if (!b) return
         var scenePoint = dragOutMouse.mapToItem(null, mouse.x, mouse.y)
-        var screenPoint = b.barDragScreenPoint(scenePoint)
-        b.barDragSceneX = scenePoint.x
-        b.barDragSceneY = scenePoint.y
-        b.barDragScreenX = screenPoint.x
-        b.barDragScreenY = screenPoint.y
-
-        var p = rootPoint(mouse)
-        var overTray = p.x >= 0 && p.x <= root.width && p.y >= 0 && p.y <= root.height
+        dragGhost.x = scenePoint.x - dragGhost.offsetX
+        dragGhost.y = scenePoint.y - dragGhost.offsetY
+        var dragged = dragDelegate || dragIconDelegate
+        orderBeforeKey = null
+        barDrop = null
 
         // Over the tray the release reorders — widgets and icons share one
-        // order, so a single pick covers both kinds. Clear the bar-level
-        // drop target and mark the in-tray insertion edge, reusing the
-        // bar's marker rendering for the visual.
-        if (overTray) {
-          b.barDragTarget = null
-          b.barDragAfter = false
-          var pick = root.drawerReorderPick(scenePoint, dragDelegate || dragIconDelegate)
+        // order, so a single pick covers both kinds.
+        if (root.containsScene(root, scenePoint)) {
+          var pick = root.drawerReorderPick(scenePoint, dragged)
           orderBeforeKey = pick ? pick.beforeKey : null
-          b.barDragTargetGeometry = pick ? b.dropMarkerRect(pick.delegate, pick.after) : null
+          root.showMarker(pick ? pick.delegate : null, pick ? pick.after : false)
           return
         }
-        orderBeforeKey = null
 
         // Status-notifier icons only ever move inside the tray: outside it
         // there is no drop target and the release is a no-op.
-        if (dragIconDelegate) {
-          b.barDragTarget = null
-          b.barDragAfter = false
-          b.barDragTargetGeometry = null
-          return
-        }
-        var drop = b.moduleDropAtScene(scenePoint, fakeDragSlot)
-        b.barDragTarget = drop ? drop.slot : null
-        b.barDragAfter = drop ? drop.after : false
-        b.barDragTargetGeometry = drop ? b.dropMarkerRect(drop.slot, drop.after) : null
+        barDrop = dragDelegate ? root.barDropAt(scenePoint) : null
+        root.showMarker(barDrop ? barDrop.slot : null, barDrop ? barDrop.after : false)
       }
 
       onPressed: function(mouse) {
@@ -646,7 +685,7 @@ BarWidget {
       }
 
       onPositionChanged: function(mouse) {
-        if (!canReorder || !(dragDelegate || dragIconDelegate) || !(mouse.buttons & Qt.LeftButton)) return
+        if (!root.canDrag || !(dragDelegate || dragIconDelegate) || !(mouse.buttons & Qt.LeftButton)) return
 
         var distance = Math.abs(mouse.x - pressedX) + Math.abs(mouse.y - pressedY)
         if (!dragging && distance >= dragThreshold) {
@@ -663,27 +702,13 @@ BarWidget {
         if (!wasDragging) return
 
         suppressClick = true
-        var b = root.bar
-        var target = b ? b.barDragTarget : null
-        var after = b ? b.barDragAfter : false
-        var widgetId = fakeDragSlot.moduleName
-        var reorder = orderBeforeKey
-        orderBeforeKey = null
-        var wasIconDrag = dragIconDelegate !== null
-        dragIconDelegate = null
-        var toRegion = target ? String(target.region || "") : ""
-        var beforeName = ""
-        if (target && b) {
-          beforeName = after
-            ? String(b.nextVisibleModuleName(target.region, target.moduleName, fakeDragSlot) || "")
-            : String(target.moduleName || "")
-        }
-        if (b) b.clearBarDrag()
-        fakeDragSlot.activeItem = null
-        fakeDragSlot.moduleName = ""
         mouse.accepted = true
-
-        if (!widgetId || !b || !b.shell) return
+        var dragged = dragDelegate || dragIconDelegate
+        var widgetId = dragged ? String(dragged.widgetId || dragged.itemId || "") : ""
+        var reorder = orderBeforeKey
+        var drop = barDrop
+        resetDrag()
+        if (!widgetId) return
 
         // Released over the tray: rearrange the shared order (widgets and
         // icons alike). A settings-only write, so no bar rebuild occurs;
@@ -695,31 +720,22 @@ BarWidget {
           return
         }
 
-        // Icon drags never leave the tray: outside it the release is a no-op.
-        if (wasIconDrag) return
+        if (drop && root.trayService)
+          root.trayService.release(root.moduleName, widgetId, drop.region, drop.beforeName)
+      }
 
-        if (!target || !toRegion) return
-        var shellRef = b.shell
-        var trayId = root.moduleName || "io.github.tyrichards.tray"
-        // Deferred for the same reason as drag-in: a synchronous write would
-        // rebuild the bar while this release handler is on the stack. The
-        // closure holds only the shell reference and plain values.
-        Qt.callLater(function() {
-          if (typeof shellRef.mutateShellConfig !== "function") return
-          shellRef.mutateShellConfig(function(config) {
-            TrayModel.dragOutOfTray(config, trayId, widgetId, toRegion, beforeName)
-          })
-        })
+      function resetDrag() {
+        orderBeforeKey = null
+        barDrop = null
+        dragDelegate = null
+        dragIconDelegate = null
+        root.endDragVisuals()
       }
 
       onCanceled: {
         dragging = false
         suppressClick = false
-        orderBeforeKey = null
-        dragIconDelegate = null
-        if (root.bar && root.bar.barDragSource === fakeDragSlot) root.bar.clearBarDrag()
-        fakeDragSlot.activeItem = null
-        fakeDragSlot.moduleName = ""
+        resetDrag()
       }
 
       onClicked: function(mouse) {
@@ -1637,7 +1653,8 @@ BarWidget {
 
     Component.onCompleted: root.registerTrayIconDelegate(trayItemRoot)
     Component.onDestruction: {
-      root.unregisterTrayIconDelegate(trayItemRoot)
+      // A plugin rescan can destroy the tray before its icon delegates.
+      if (root) root.unregisterTrayIconDelegate(trayItemRoot)
       if (dragOutMouse && dragOutMouse.dragIconDelegate === trayItemRoot) dragOutMouse.dragIconDelegate = null
     }
 
