@@ -22,9 +22,33 @@ BarWidget {
   // Omarchy 4 gives third-party widgets a scoped bar facade. The companion
   // service receives the capability-filtered widget catalogue and exposes it
   // back to this tray through the plugin's own scoped service lookup.
-  readonly property var trayService: bar && bar.shell && typeof bar.shell.serviceFor === "function"
-    ? bar.shell.serviceFor(root.moduleName) : null
+  //
+  // The lookup is a function call, so a binding would resolve it once and
+  // never again. A plugin registry rescan (any plugin added, removed or
+  // touched) rebuilds services; the old reference then goes null and drag
+  // and drop stayed disabled until the shell restarted. Re-resolve on a
+  // cheap timer instead and swap in the live service whenever it changes.
+  property var trayService: null
   readonly property var hostedWidgetRegistry: trayService ? trayService.barWidgetRegistry : null
+
+  function resolveTrayService() {
+    var live = bar && bar.shell && typeof bar.shell.serviceFor === "function"
+      ? bar.shell.serviceFor(root.moduleName) : null
+    if (live !== trayService) trayService = live
+  }
+
+  onBarChanged: resolveTrayService()
+  Component.onCompleted: {
+    resolveTrayService()
+    scheduleBuckets()
+  }
+
+  Timer {
+    interval: 2000
+    repeat: true
+    running: true
+    onTriggered: root.resolveTrayService()
+  }
 
   // Hover-to-expand, driven by the drag-out overlay's single HoverHandler:
   // two stacked hover items (the overlay plus a handler in the drawer) fight
@@ -57,9 +81,53 @@ BarWidget {
   // and plugin widgets interleave freely. Missing tokens keep arrival order
   // after the arranged ones.
   readonly property var orderIds: TrayModel.asList(settings.order).map(String)
-  readonly property var drawerItems: bucket("drawer")
-  readonly property var allItems: bucket("all")
+  // Recomputed outside any binding. Reading a freshly registered item's
+  // status/id/title fetches it over DBus and emits the change signal while
+  // the read is still in progress, so a `bucket()` binding re-dirtied itself
+  // mid-evaluation and Qt logged a binding loop on every icon arrival. Every
+  // input instead schedules one coalesced recompute on the next tick.
+  property var drawerItems: []
+  property var allItems: []
   readonly property int drawerCount: drawerItems.length
+  property bool bucketsPending: false
+
+  function scheduleBuckets() {
+    if (bucketsPending) return
+    bucketsPending = true
+    Qt.callLater(root.recomputeBuckets)
+  }
+
+  function recomputeBuckets() {
+    bucketsPending = false
+    drawerItems = bucket("drawer")
+    allItems = bucket("all")
+  }
+
+  onShowTrayIconsChanged: scheduleBuckets()
+  onHiddenIdsChanged: scheduleBuckets()
+  onOrderIdsChanged: scheduleBuckets()
+  Connections {
+    target: root.bar
+    ignoreUnknownSignals: true
+    function onLayoutConfigChanged() { root.scheduleBuckets() }
+  }
+  Connections {
+    target: SystemTray.items
+    ignoreUnknownSignals: true
+    function onValuesChanged() { root.scheduleBuckets() }
+  }
+  Instantiator {
+    model: SystemTray.items
+    delegate: Connections {
+      required property var modelData
+      target: modelData
+      ignoreUnknownSignals: true
+      function onStatusChanged() { root.scheduleBuckets() }
+      function onIdChanged() { root.scheduleBuckets() }
+      function onTitleChanged() { root.scheduleBuckets() }
+      function onTooltipTitleChanged() { root.scheduleBuckets() }
+    }
+  }
   readonly property int trayItemExtent: Style.bar.iconSlot
 
   // Bar widgets captured into the drawer. Stored on this widget's own
@@ -227,7 +295,10 @@ BarWidget {
   // ---------------------------------------------------------------------------
 
   readonly property bool canDrag: trayService !== null
-  onCanDragChanged: if (!canDrag) console.warn("Tray: companion service unavailable; drag and drop disabled")
+  onCanDragChanged: {
+    if (!canDrag) console.warn("Tray: companion service unavailable; drag and drop disabled")
+    else console.info("Tray: companion service connected; drag and drop enabled")
+  }
 
   // Module slots of this bar window, excluding the tray's own. Cached: the
   // tree walk is cheap but not free, and slots only change on layout edits.
