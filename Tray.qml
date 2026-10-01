@@ -89,16 +89,21 @@ BarWidget {
   property var drawerItems: []
   property var allItems: []
   readonly property int drawerCount: drawerItems.length
-  property bool bucketsPending: false
+
+  // A child Timer rather than Qt.callLater: it dies with this widget, so a
+  // recompute queued just before a plugin reload tears the tray down never
+  // runs against the destroyed instance.
+  Timer {
+    id: bucketsTimer
+    interval: 0
+    onTriggered: root.recomputeBuckets()
+  }
 
   function scheduleBuckets() {
-    if (bucketsPending) return
-    bucketsPending = true
-    Qt.callLater(root.recomputeBuckets)
+    bucketsTimer.restart()
   }
 
   function recomputeBuckets() {
-    bucketsPending = false
     drawerItems = bucket("drawer")
     allItems = bucket("all")
   }
